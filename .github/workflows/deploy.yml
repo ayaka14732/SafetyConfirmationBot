@@ -24,8 +24,8 @@ jobs:
         fetch-depth: 0
     - name: dist
       run: |
-        mkdir dist
         cp -r website/ dist/
+        mv dist/index.template.html dist/index.html
         sed -i "s|@@NAME_JA@@|${{ vars.NAME_JA }}|g" dist/index.html
         sed -i "s|@@NAME_EN@@|${{ vars.NAME_EN }}|g" dist/index.html
         sed -i "s|@@TIME_JA@@|${{ vars.TIME_JA }}|g" dist/index.html
