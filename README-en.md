@@ -74,7 +74,7 @@ Send `/getid`.
 
 It will return your Telegram user ID. Save this.
 
-## 7. Server Setup
+### 7. Server Setup
 
 On your server, clone your fork:
 
