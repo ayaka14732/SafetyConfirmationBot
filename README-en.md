@@ -97,12 +97,7 @@ Set up a cron job to run once a day.
 Example `crontab -e` entry:
 
 ```cron
-0 7 * * * GITHUB_REPO="your-username/your-repo" \
-GITHUB_TOKEN="github_pat_..." \
-TELEGRAM_BOT_TOKEN="1234567890:AA..." \
-TELEGRAM_USER_ID="123456789" \
-/path/to/your/repo/integrations/telegram/venv/bin/python \
-/path/to/your/repo/integrations/telegram/main.py
+0 7 * * * GITHUB_REPO="your-username/your-repo" GITHUB_TOKEN="github_pat_..." TELEGRAM_BOT_TOKEN="1234567890:AA..." TELEGRAM_USER_ID="123456789" /path/to/your/repo/integrations/telegram/venv/bin/python /path/to/your/repo/integrations/telegram/main.py
 ```
 
 This will send the confirmation message every day at 07:00.
