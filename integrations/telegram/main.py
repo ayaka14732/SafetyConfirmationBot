@@ -195,7 +195,6 @@ def main():
     old_time_en = data["TIME_EN"]
     location_ja = data["LOCATION_JA"]
     warning_class = data["WARNING_CLASS"]
-    warning_days = data["WARNING_DAYS"]
 
     result = wait_for_response(location_ja)
 
@@ -205,8 +204,6 @@ def main():
         update_variable("TIME_JA", format_time_ja(now))
         if warning_class != "hidden":
             update_variable("WARNING_CLASS", "hidden")
-        if warning_days != "0":
-            update_variable("WARNING_DAYS", "0")
 
         send_message("ご確認ありがとうございます。")
 
@@ -218,8 +215,10 @@ def main():
         update_variable("LOCATION_EN", new_en)
         update_variable("TIME_EN", format_time_en(now))
         update_variable("TIME_JA", format_time_ja(now))
-        update_variable("WARNING_CLASS", "hidden")
-        update_variable("WARNING_DAYS", "0")
+        if warning_class != "hidden":
+            update_variable("WARNING_CLASS", "hidden")
+
+        send_message("ご確認ありがとうございます。")
 
     elif result == "timeout":
         old_dt = parse_time_en(old_time_en)
