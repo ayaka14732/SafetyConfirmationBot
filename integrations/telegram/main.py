@@ -27,34 +27,68 @@ GITHUB_HEADERS = {
     "X-GitHub-Api-Version": "2022-11-28",
 }
 
+# Without a timeout, a response lost in transit blocks the process forever.
+HTTP_TIMEOUT = 20  # seconds, for ordinary requests
+LONG_POLL_SECONDS = 30  # how long Telegram holds a getUpdates request open
+LONG_POLL_TIMEOUT = LONG_POLL_SECONDS + 10  # seconds, for getUpdates long polls
+HTTP_ATTEMPTS = 5
+RETRY_DELAY = 5  # seconds
+
 # =========================
 # Utilities
 # =========================
 
+def http(method: str, url: str, **kwargs) -> requests.Response:
+    """Send a request with a timeout, retrying on network errors."""
+    kwargs.setdefault("timeout", HTTP_TIMEOUT)
+    for attempt in range(1, HTTP_ATTEMPTS + 1):
+        try:
+            r = requests.request(method, url, **kwargs)
+            r.raise_for_status()
+            return r
+        except (requests.ConnectionError, requests.Timeout) as e:
+            print(f"{method} failed ({attempt}/{HTTP_ATTEMPTS}): {type(e).__name__}", file=sys.stderr, flush=True)
+            if attempt == HTTP_ATTEMPTS:
+                raise
+            time.sleep(RETRY_DELAY)
+
+def get_updates(offset: int | None) -> list[dict]:
+    """Long-poll Telegram for updates. Returns an empty list on network errors, so callers just poll again."""
+    params = {"timeout": LONG_POLL_SECONDS}
+    if offset:
+        params["offset"] = offset
+    try:
+        r = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+            params=params,
+            timeout=LONG_POLL_TIMEOUT,
+        )
+        r.raise_for_status()
+    except (requests.ConnectionError, requests.Timeout) as e:
+        print(f"getUpdates failed: {type(e).__name__}", file=sys.stderr, flush=True)
+        time.sleep(RETRY_DELAY)
+        return []
+    return r.json()["result"]
+
 def get_repo_variables() -> dict[str, str]:
     url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/variables"
-    r = requests.get(url, headers=GITHUB_HEADERS)
-    r.raise_for_status()
+    r = http("GET", url, headers=GITHUB_HEADERS)
     data = r.json()
     return {v["name"]: v["value"] for v in data["variables"]}
 
 def update_variable(name: str, value: str) -> None:
     url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/variables/{name}"
     payload = {"name": name, "value": value}
-    r = requests.patch(url, headers=GITHUB_HEADERS, json=payload)
-    r.raise_for_status()
+    http("PATCH", url, headers=GITHUB_HEADERS, json=payload)
 
 def dispatch_workflow() -> None:
     url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/workflows/{WORKFLOW_FILE}/dispatches"
     payload = {"ref": "main"}
-    r = requests.post(url, headers=GITHUB_HEADERS, json=payload)
-    r.raise_for_status()
+    http("POST", url, headers=GITHUB_HEADERS, json=payload)
 
 def telegram_api(method, data=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
-    r = requests.post(url, json=data)
-    r.raise_for_status()
-    return r.json()
+    return http("POST", url, json=data).json()
 
 def send_message(text, reply_markup=None):
     payload = {
@@ -69,15 +103,16 @@ def answer_callback(callback_id):
     telegram_api("answerCallbackQuery", {"callback_query_id": callback_id})
 
 def discard_old_updates():
-    r = requests.get(
+    r = http(
+        "GET",
         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
         params={"timeout": 0},
     )
-    r.raise_for_status()
     updates = r.json()["result"]
     if updates:
         last_update_id = updates[-1]["update_id"]
-        requests.get(
+        http(
+            "GET",
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
             params={"offset": last_update_id + 1, "timeout": 0},
         )
@@ -131,16 +166,7 @@ def wait_for_response(location_ja: str) -> Literal["confirm", "timeout"] | tuple
         if time.time() - start_time > TIMEOUT_SECONDS:
             return "timeout"
 
-        params = {"timeout": 30}
-        if offset:
-            params["offset"] = offset
-
-        r = requests.get(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
-            params=params,
-        )
-        r.raise_for_status()
-        updates = r.json()["result"]
+        updates = get_updates(offset)
 
         for u in updates:
             offset = u["update_id"] + 1
@@ -169,12 +195,7 @@ def wait_for_response(location_ja: str) -> Literal["confirm", "timeout"] | tuple
 
 def wait_text(offset: int) -> tuple[str, int]:
     while True:
-        r = requests.get(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
-            params={"timeout": 30, "offset": offset},
-        )
-        r.raise_for_status()
-        updates = r.json()["result"]
+        updates = get_updates(offset)
 
         for u in updates:
             offset = u["update_id"] + 1
