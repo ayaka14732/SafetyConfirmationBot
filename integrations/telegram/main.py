@@ -6,6 +6,7 @@ import os
 import requests
 import sys
 import time
+import traceback
 from typing import Literal
 from zoneinfo import ZoneInfo
 
@@ -31,64 +32,92 @@ GITHUB_HEADERS = {
 HTTP_TIMEOUT = 20  # seconds, for ordinary requests
 LONG_POLL_SECONDS = 30  # how long Telegram holds a getUpdates request open
 LONG_POLL_TIMEOUT = LONG_POLL_SECONDS + 10  # seconds, for getUpdates long polls
-HTTP_ATTEMPTS = 5
-RETRY_DELAY = 5  # seconds
+RETRY_DELAY_MIN = 5  # seconds
+RETRY_DELAY_MAX = 60  # seconds
+
+# A network failure must never end the run: requests are retried until this moment.
+# It is a little later than the reply timeout, so a reply given at the last minute can still be recorded.
+RETRY_DEADLINE = time.time() + TIMEOUT_SECONDS + 30 * 60
 
 # =========================
 # Utilities
 # =========================
 
-def http(method: str, url: str, **kwargs) -> requests.Response:
-    """Send a request with a timeout, retrying on network errors."""
+def log(message: str) -> None:
+    now = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S %Z")
+    print(f"[{now}] {message}", file=sys.stderr, flush=True)
+
+def describe(e: requests.RequestException) -> str:
+    """Describe a failed request, including the response body if there is one."""
+    r = e.response
+    if r is None:
+        return type(e).__name__
+    return f"HTTP {r.status_code}: {r.text[:500]}"
+
+def is_temporary(e: requests.RequestException) -> bool:
+    """Network errors, rate limits and server errors are worth retrying. Other HTTP errors are not."""
+    r = e.response
+    return r is None or r.status_code == 429 or r.status_code >= 500
+
+def http(method: str, url: str, *, name: str, retry: bool = True, **kwargs) -> requests.Response:
+    """Send a request with a timeout. Temporary failures are retried until RETRY_DEADLINE."""
     kwargs.setdefault("timeout", HTTP_TIMEOUT)
-    for attempt in range(1, HTTP_ATTEMPTS + 1):
+    delay = RETRY_DELAY_MIN
+    while True:
         try:
             r = requests.request(method, url, **kwargs)
             r.raise_for_status()
             return r
-        except (requests.ConnectionError, requests.Timeout) as e:
-            print(f"{method} failed ({attempt}/{HTTP_ATTEMPTS}): {type(e).__name__}", file=sys.stderr, flush=True)
-            if attempt == HTTP_ATTEMPTS:
+        except requests.RequestException as e:
+            log(f"{name} failed: {describe(e)}")
+            if not retry or not is_temporary(e) or time.time() + delay > RETRY_DEADLINE:
                 raise
-            time.sleep(RETRY_DELAY)
+            time.sleep(delay)
+            delay = min(delay * 2, RETRY_DELAY_MAX)
+
+get_updates_delay = RETRY_DELAY_MIN
 
 def get_updates(offset: int | None) -> list[dict]:
-    """Long-poll Telegram for updates. Returns an empty list on network errors, so callers just poll again."""
+    """Long-poll Telegram for updates. Returns an empty list on failure, so callers just poll again."""
+    global get_updates_delay
     params = {"timeout": LONG_POLL_SECONDS}
     if offset:
         params["offset"] = offset
     try:
-        r = requests.get(
+        r = http(
+            "GET",
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+            name="getUpdates",
+            retry=False,
             params=params,
             timeout=LONG_POLL_TIMEOUT,
         )
-        r.raise_for_status()
-    except (requests.ConnectionError, requests.Timeout) as e:
-        print(f"getUpdates failed: {type(e).__name__}", file=sys.stderr, flush=True)
-        time.sleep(RETRY_DELAY)
+    except requests.RequestException:
+        time.sleep(get_updates_delay)
+        get_updates_delay = min(get_updates_delay * 2, RETRY_DELAY_MAX)
         return []
+    get_updates_delay = RETRY_DELAY_MIN
     return r.json()["result"]
 
 def get_repo_variables() -> dict[str, str]:
     url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/variables"
-    r = http("GET", url, headers=GITHUB_HEADERS)
+    r = http("GET", url, name="GitHub: read variables", headers=GITHUB_HEADERS)
     data = r.json()
     return {v["name"]: v["value"] for v in data["variables"]}
 
 def update_variable(name: str, value: str) -> None:
     url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/variables/{name}"
     payload = {"name": name, "value": value}
-    http("PATCH", url, headers=GITHUB_HEADERS, json=payload)
+    http("PATCH", url, name=f"GitHub: update {name}", headers=GITHUB_HEADERS, json=payload)
 
 def dispatch_workflow() -> None:
     url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/workflows/{WORKFLOW_FILE}/dispatches"
     payload = {"ref": "main"}
-    http("POST", url, headers=GITHUB_HEADERS, json=payload)
+    http("POST", url, name="GitHub: dispatch workflow", headers=GITHUB_HEADERS, json=payload)
 
-def telegram_api(method, data=None):
+def telegram_api(method, data=None, retry=True):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
-    return http("POST", url, json=data).json()
+    return http("POST", url, name=method, retry=retry, json=data).json()
 
 def send_message(text, reply_markup=None):
     payload = {
@@ -100,12 +129,18 @@ def send_message(text, reply_markup=None):
     telegram_api("sendMessage", payload)
 
 def answer_callback(callback_id):
-    telegram_api("answerCallbackQuery", {"callback_query_id": callback_id})
+    # This only stops the loading animation on the button. The button press itself has
+    # already been received, so a failure here (e.g. the query has expired) is ignored.
+    try:
+        telegram_api("answerCallbackQuery", {"callback_query_id": callback_id}, retry=False)
+    except requests.RequestException:
+        pass
 
 def discard_old_updates():
     r = http(
         "GET",
         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+        name="getUpdates",
         params={"timeout": 0},
     )
     updates = r.json()["result"]
@@ -114,6 +149,7 @@ def discard_old_updates():
         http(
             "GET",
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+            name="getUpdates",
             params={"offset": last_update_id + 1, "timeout": 0},
         )
 
@@ -265,4 +301,8 @@ def main():
     sys.exit(0)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        log(traceback.format_exc())
+        sys.exit(1)
